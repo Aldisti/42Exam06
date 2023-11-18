@@ -51,7 +51,34 @@ void	ft_free(void **ptr) {
 	*ptr = 0;
 }
 
-char *str_join(char *buf, char *add)
+int extract_message(char **buf, char **msg)
+{
+	char	*newbuf;
+	int	i;
+
+	*msg = 0;
+	if (*buf == 0)
+		return (0);
+	i = 0;
+	while ((*buf)[i])
+	{
+		if ((*buf)[i] == '\n')
+		{
+			newbuf = calloc(1, sizeof(*newbuf) * (strlen(*buf + i + 1) + 1));
+			if (newbuf == 0)
+				return (-1);
+			strcpy(newbuf, *buf + i + 1);
+			*msg = *buf;
+			(*msg)[i + 1] = 0;
+			*buf = newbuf;
+			return (1);
+		}
+		i++;
+	}
+	return (0);
+}
+
+char *str_join(char *buf, char *add, int to_free)
 {
 	char	*newbuf;
 	int		len;
@@ -62,7 +89,8 @@ char *str_join(char *buf, char *add)
 		return (0);
 	if (buf)
 		strcat(newbuf, buf);
-	ft_free((void **) &buf);
+	if (to_free)
+		ft_free((void **) &buf);
 	strcat(newbuf, add);
 	return (newbuf);
 }
@@ -91,9 +119,14 @@ void	ft_shrink(t_serv *serv) {
 	i = 0;
 	j = 0;
 	bzero(tab, FD_SETSIZE);
-	while (i < serv->nfds)
+	while (i < serv->nfds) {
 		if (serv->fds[i++].fd > 0)
 			tab[j++] = serv->fds[i - 1];
+		else {
+			ft_free((void **) &serv->fds[i - 1].send);
+			ft_free((void **) &serv->fds[i - 1].recv);
+		}
+	}
 	bzero(serv->fds, FD_SETSIZE * sizeof(t_fd));
 	serv->nfds = j;
 	while (--j >= 0)
@@ -110,8 +143,50 @@ int	ft_error(t_serv *serv, const char *str) {
 	return (1);
 }
 
+/*
+ * sends 'str' to all the clients except for 'fd'
+ * if 'fd' is NULL all the clients will receive the message
+ * if 'str' is NULL the does nothing
+*/
+void	ft_send_all(t_serv *serv, char *str, int fd) {
+	if (!str)
+		return ;
+	for (int i = 0; i < serv->nfds; i++) {
+		if (serv->fds[i].fd == fd)
+			continue ;
+		serv->fds[i].send = str_join(serv->fds[i].send, str, 1);
+	}
+}
+
+void	ft_send_message(t_serv *serv, int i) {
+	char	buff[BUFFSIZE];
+	char	*tmp;
+	char	*nl;
+	int		ret;
+
+	tmp = 0;
+	nl = serv->fds[i].recv;
+	while (nl && *nl) {
+		ret = extract_message(&nl, &tmp);
+		if (!ret)
+			break ;
+		bzero(buff, BUFFSIZE);
+		sprintf(buff, "client %d: %s", serv->fds[i].id, tmp);
+		ft_send_all(serv, buff, serv->fds[i].fd);
+	}
+	if (nl && *nl) {
+		bzero(buff, BUFFSIZE);
+		sprintf(buff, "client %d: %s", serv->fds[i].id, nl);
+		ft_send_all(serv, buff, serv->fds[i].fd);
+	}
+	ft_free((void **) &nl);
+	printf("message sent: %s>", serv->fds[i].recv);
+	printf("message to send: %s>", serv->fds[i].send);
+	ft_free((void **) &serv->fds[i].recv);
+}
+
 int	main(int ac, char **av) {
-	char	*buff;
+	char	buff[BUFFSIZE];
 	t_serv	serv;
 	int		ret;
 	int		tmp;
@@ -162,24 +237,49 @@ int	main(int ac, char **av) {
 				serv.fds[serv.nfds].fd = tmp;
 				serv.fds[serv.nfds].id = serv.lid++;
 				serv.bfd = (tmp > serv.bfd) ? tmp : serv.bfd;
-				for (int i = 1; i < serv.nfds; i++) {
-					buff = (char *) calloc(BUFFSIZE, sizeof(char));
-					if (!buff)
-						return (ft_error(&serv, "Fatal error\n"));
-					sprintf(buff, "server: client %d just arrived\n", serv.fds[serv.nfds].id);
-					serv.fds[i].send = str_join(serv.fds[i].send, buff);
-					printf("%d receives: %s\n", serv.fds[i].id, serv.fds[i].send);
-				}
+				bzero(buff, BUFFSIZE);
+				sprintf(buff, "server: client %d just arrived\n", serv.fds[serv.nfds].id);
+				ft_send_all(&serv, buff, tmp);
 				serv.nfds++;
 			}
 		}
 
 		for (int i = 1; i < serv.nfds; i++) {
+			n = 0;
 			/*
 			 * recv
 			*/
 			if (FD_ISSET(serv.fds[i].fd, &serv.reads)) {
-				
+//				bzero(serv.fds[i].recv, BUFFSIZE);
+				do {
+					bzero(buff, BUFFSIZE);
+					n = recv(serv.fds[i].fd, buff, BUFFSIZE, MSG_DONTWAIT);
+					if (!n) {
+						ft_free((void **) &serv.fds[i].recv);
+						break ;
+					}
+					printf("receiving: %s>", buff);
+					serv.fds[i].recv = str_join(serv.fds[i].recv, buff, 1);
+				} while (n == BUFFSIZE);
+				printf("\nreceiving from %d: %s\n", serv.fds[i].id, serv.fds[i].recv);
+				/*
+				 * close connection
+				*/
+				if (!n && !serv.fds[i].recv) {
+					serv.fds[i].fd = -1;
+					bzero(buff, BUFFSIZE);
+					sprintf(buff, "server: client %d just left\n", serv.fds[i].id);
+					ft_send_all(&serv, buff, serv.fds[i].fd);
+				}
+				else if (n < 0) {
+					printf("Error: 'recv' failed on %d\n", serv.fds[i].id);
+				}
+				/*
+				 * send message received to all the clients
+				*/
+				else {
+					ft_send_message(&serv, i);
+				}
 			}
 			/*
 			 * send
@@ -193,7 +293,7 @@ int	main(int ac, char **av) {
 				}
 			}
 			if (FD_ISSET(serv.fds[i].fd, &serv.errors))
-				;
+				printf("ERROR: %d\n", serv.fds[i].id);
 		}
 	}
 }
